@@ -57,15 +57,17 @@ module Extensions =
 
 
 let ``Bindable CancellableTask`` =
-    testCaseAsync "Bindable CancellableTask" <| async {
+    ftestCaseAsync "Bindable CancellableTask" <| async {
         let mutable wasCalled = false
         let sideEffect (ct : CancellationToken) = task {
+            printfn "sideEffect1"
             do! Task.Delay(TimeSpan.FromSeconds(5.), ct)
+            printfn "sideEffect2"
             wasCalled <- true
         }
 
         let inner = async {
-            do! sideEffect
+            do! sideEffect CancellationToken.None
             Expect.isFalse wasCalled "Side effect should not occur"
         }
 
@@ -110,9 +112,40 @@ let ``AsyncResult passes along cancellationToken`` =
             ()
     }
 
+let ``Foo`` =
+    testCaseAsync "Foo" <| async {
+        let mutable wasCalled = false
+        let sideEffect (ct : CancellationToken) = task {
+            printfn "sideeffect1"
+            do! Task.Delay(TimeSpan.FromSeconds(5.), ct)
+            printfn "sideeffect2"
+            wasCalled <- true
+        }
+
+        use cts = new CancellationTokenSource ()
+        cts.CancelAfter(TimeSpan.FromSeconds(0.1))
+
+        let topLevel = taskCt cts.Token {
+            let! r = sideEffect CancellationToken.None
+            return r
+            // return! sideEffect CancellationToken.None
+            // return r
+        }
+
+        try
+            let! _ = topLevel
+            ()
+        with :? TaskCanceledException as e ->
+            // Cancellation is the point here
+            printfn "TaskCanceledException -> %A" e
+            ()
+        Expect.isFalse wasCalled "Side effect should not occur"
+    }
+
 [<Tests>]
 let tests =
     testList "AsyncTests" [
         ``Bindable CancellableTask``
         ``AsyncResult passes along cancellationToken``
+        ``Foo``
     ]
