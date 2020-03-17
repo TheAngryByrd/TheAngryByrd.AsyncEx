@@ -8,6 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 // open FSharp.Control.Tasks.CopiedDoNotReference.V2.ContextInsensitive
 open TAB.FSharp.Control.Tasks.V2.ContextInsensitive
+open FsToolkit.ErrorHandling
 
 type CancellableTask<'a> = CancellationToken -> Task<'a>
 
@@ -55,15 +56,12 @@ module Extensions =
             async.ReturnFrom augmented
 
 
-[<Tests>]
-let tests =
-    testList "AsyncTests" [
-        testCaseAsync "Bindable CancellableTask" <| async {
+let ``Bindable CancellableTask`` =
+    testCaseAsync "Bindable CancellableTask" <| async {
             let mutable wasCalled = false
             let sideEffect (ct : CancellationToken) = task {
                 do! Task.Delay(TimeSpan.FromSeconds(5.), ct)
                 wasCalled <- true
-                return ()
             }
 
             let inner = async {
@@ -79,4 +77,42 @@ let tests =
                 // Cancellation is the point here
                 ()
         }
+
+let ``AsyncResult passes along cancellationToken`` =
+    testCaseAsync "AsyncResult passes along cancellationToken" <| async {
+
+        let mutable wasCalled = false
+        let sideEffect (ct : CancellationToken) = task {
+            do! Task.Delay(TimeSpan.FromSeconds(5.), ct)
+            wasCalled <- true
+        }
+
+        let lowLevel = async {
+            do! sideEffect
+        }
+
+        let midLevel = asyncResult {
+            let! result = lowLevel
+            return result
+        }
+
+        let topLevel = async {
+            return! midLevel
+        }
+
+        use cts = new CancellationTokenSource ()
+        cts.CancelAfter(TimeSpan.FromSeconds(1.1))
+        try
+            let! _ = Async.WithCancellation2 cts.Token topLevel
+            ()
+        with :? TaskCanceledException as e ->
+            // Cancellation is the point here
+            ()
+    }
+
+[<Tests>]
+let tests =
+    testList "AsyncTests" [
+        ``Bindable CancellableTask``
+        ``AsyncResult passes along cancellationToken``
     ]
