@@ -9,11 +9,11 @@
 // You should have received a copy of the CC0 Public Domain Dedication along with this software.
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 
-namespace TAB.FSharp.Control.Tasks
+namespace TAB2.FSharp.Control.Tasks
 open System
+open System.Threading
 open System.Threading.Tasks
 open System.Runtime.CompilerServices
-open System.Threading
 
 // This module is not really obsolete, but it's not intended to be referenced directly from user code.
 // However, it can't be private because it is used within inline functions that *are* user-visible.
@@ -24,52 +24,30 @@ module TaskBuilder =
     /// either awaiting something with a continuation,
     /// or completed with a return value.
     type Step<'a> =
-        | Await of ICriticalNotifyCompletion * (CancellationToken -> Step<'a>) * CancellationToken
-        | Return of 'a * CancellationToken
+        | Await of ICriticalNotifyCompletion * (CancellationToken -> unit -> Step<'a>)
+        | Return of 'a
         /// We model tail calls explicitly, but still can't run them without O(n) memory usage.
-        | ReturnFrom of 'a Task * CancellationToken
+        | ReturnFrom of 'a Task
     /// Implements the machinery of running a `Step<'m, 'm>` as a task returning a continuation task.
-    and StepStateMachine<'a>(parentCt, firstStep) as this =
+    and StepStateMachine<'a>(cTok, firstStep) as this =
         let methodBuilder = AsyncTaskMethodBuilder<'a Task>()
         /// The continuation we left off awaiting on our last MoveNext().
-        let mutable continuation = fun () -> firstStep
+        let mutable continuation = fun (cTok : CancellationToken) () -> firstStep
         /// Returns next pending awaitable or null if exiting (including tail call).
         let nextAwaitable() =
             try
-                match continuation() with
-                | Return (r, ct) ->
-                    let cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt, ct)
-                    printfn "Return"
-                    cts.Token.ThrowIfCancellationRequested()
-                    printfn "Return2"
+                match continuation(cTok) () with
+                | Return r ->
                     methodBuilder.SetResult(Task.FromResult(r))
                     null
-                | ReturnFrom (t, ct) ->
-                    let cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt, ct)
-                    printfn "ReturnFrom"
-                    cts.Token.ThrowIfCancellationRequested()
-                    printfn "ReturnFrom2"
+                | ReturnFrom t ->
                     methodBuilder.SetResult(t)
                     null
-                | Await (await, next, ct) ->
-                    printfn "Await"
-                    let cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt, ct)
-                    cts.Token.ThrowIfCancellationRequested()
-                    // ct.ThrowIfCancellationRequested()
-                    printfn "Await2"
-                    continuation <-
-                        fun () ->
-                            use cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt, ct)
-                            cts.Token.ThrowIfCancellationRequested()
-                            next cts.Token
+                | Await (await, next) ->
+                    continuation <- next
                     await
             with
-            | :? OperationCanceledException as e ->
-                // printfn "OperationCanceledException -> %A" e
-                methodBuilder.SetResult(Task.FromCanceled<_> e.CancellationToken)
-                null
             | exn ->
-                printfn "--> %A" exn
                 methodBuilder.SetException(exn)
                 null
         let mutable self = this
@@ -95,10 +73,12 @@ module TaskBuilder =
         else agg :> Exception
 
     /// Used to represent no-ops like the implicit empty "else" branch of an "if" expression.
-    let zero = Return ((), CancellationToken.None)
+    let zero = Return ()
 
     /// Used to return a value.
-    let ret ct (x : 'a) = Return (x, ct)
+    let ret (cTok : CancellationToken) (x : 'a) =
+        cTok.ThrowIfCancellationRequested()
+        Return x
 
     type Binder<'out> =
         // We put the output generic parameter up here at the class level, so it doesn't get subject to
@@ -117,12 +97,12 @@ module TaskBuilder =
                                             and ^awt :> ICriticalNotifyCompletion
                                             and ^awt : (member get_IsCompleted : unit -> bool)
                                             and ^awt : (member GetResult : unit -> ^inp) >
-            (abl : CancellationToken -> ^abl, continuation : ^inp -> 'out Step, ct) : 'out Step =
-                let awt ct= (^abl : (member GetAwaiter : unit -> ^awt)(abl ct)) // get an awaiter from the awaitable
-                if (^awt : (member get_IsCompleted : unit -> bool)(awt ct)) then // shortcut to continue immediately
-                    continuation (^awt : (member GetResult : unit -> ^inp)(awt ct))
+            (abl : ^abl, continuation : CancellationToken -> ^inp -> 'out Step) : 'out Step =
+                let awt = (^abl : (member GetAwaiter : unit -> ^awt)(abl)) // get an awaiter from the awaitable
+                if (^awt : (member get_IsCompleted : unit -> bool)(awt)) then // shortcut to continue immediately
+                    continuation CancellationToken.None (^awt : (member GetResult : unit -> ^inp)(awt))
                 else
-                    Await (awt ct, (fun (ct) -> continuation (^awt : (member GetResult : unit -> ^inp)(awt ct))), ct)
+                    Await (awt, fun (cTok) () -> continuation cTok (^awt : (member GetResult : unit -> ^inp)(awt)))
 
         static member inline GenericAwaitConfigureFalse< ^tsk, ^abl, ^awt, ^inp
                                                         when ^tsk : (member ConfigureAwait : bool -> ^abl)
@@ -130,80 +110,79 @@ module TaskBuilder =
                                                         and ^awt :> ICriticalNotifyCompletion
                                                         and ^awt : (member get_IsCompleted : unit -> bool)
                                                         and ^awt : (member GetResult : unit -> ^inp) >
-            (tsk : CancellationToken -> ^tsk, continuation : ^inp -> 'out Step, ct) : 'out Step =
-                let abl ct = (^tsk : (member ConfigureAwait : bool -> ^abl)(tsk ct, false))
-                Binder<'out>.GenericAwait(abl, continuation, ct)
+            (tsk : ^tsk, continuation : CancellationToken -> ^inp -> 'out Step) : 'out Step =
+                let abl = (^tsk : (member ConfigureAwait : bool -> ^abl)(tsk, false))
+                Binder<'out>.GenericAwait(abl, continuation)
 
     /// Special case of the above for `Task<'a>`. Have to write this out by hand to avoid confusing the compiler
     /// trying to decide between satisfying the constraints with `Task` or `Task<'a>`.
-    let bindTask ct (task : 'a Task) (continuation : 'a -> Step<'b>) =
+    let bindTask cTok (task : 'a Task) (continuation : CancellationToken -> 'a -> Step<'b>) =
         let awt = task.GetAwaiter()
         if awt.IsCompleted then // Proceed to the next step based on the result we already have.
-            continuation(awt.GetResult())
+            continuation cTok (awt.GetResult())
         else // Await and continue later when a result is available.
-            Await (awt, (fun (ct) -> continuation(awt.GetResult())), ct)
+            Await (awt, (fun cTok () -> continuation cTok (awt.GetResult())))
 
     /// Special case of the above for `Task<'a>`, for the context-insensitive builder.
     /// Have to write this out by hand to avoid confusing the compiler thinking our built-in bind method
     /// defined on the builder has fancy generic constraints on inp and out parameters.
-    let bindTaskConfigureFalse ct (task : 'a Task) (continuation : 'a -> Step<'b>) =
+    let bindTaskConfigureFalse cTok (task : 'a Task) (continuation : CancellationToken -> 'a -> Step<'b>) =
         let awt = task.ConfigureAwait(false).GetAwaiter()
         if awt.IsCompleted then // Proceed to the next step based on the result we already have.
-            continuation(awt.GetResult())
+            continuation cTok (awt.GetResult())
         else // Await and continue later when a result is available.
-            Await (awt, (fun (ct) -> continuation(awt.GetResult())), ct)
+            Await (awt, (fun cTok () -> continuation cTok (awt.GetResult())))
 
     /// Chains together a step with its following step.
     /// Note that this requires that the first step has no result.
     /// This prevents constructs like `task { return 1; return 2; }`.
-    let rec combine (step : Step<unit>) (continuation : CancellationToken -> Step<'b>) =
+    let rec combine cTok (step : Step<unit>) (continuation : CancellationToken -> unit -> Step<'b>) =
         match step with
-        | Return (_, ct) -> continuation ct
-        | ReturnFrom (t, ct) ->
-            Await (t.GetAwaiter(), continuation, ct)
-        | Await (awaitable, next, ct) ->
-            Await (awaitable, (fun (ct) -> combine (next ct) continuation), ct)
+        | Return _ -> continuation cTok ()
+        | ReturnFrom t ->
+            Await (t.GetAwaiter(), continuation)
+        | Await (awaitable, next) ->
+            Await (awaitable, fun cTok () -> combine cTok (next cTok ()) continuation)
 
     /// Builds a step that executes the body while the condition predicate is true.
-    let whileLoop ct (cond : unit -> bool) (body : CancellationToken -> Step<unit>) =
+    let whileLoop cTok (cond : unit -> bool) (body : unit -> Step<unit>) =
         if cond() then
             // Create a self-referencing closure to test whether to repeat the loop on future iterations.
-            let rec repeat (ct) =
+            let rec repeat cTok () =
                 if cond() then
-                    let body = body ct
+                    let body = body()
                     match body with
-                    | Return _ -> repeat ct
-                    | ReturnFrom (t, ct) -> Await(t.GetAwaiter(), repeat, ct)
-                    | Await (awaitable, next, ct) ->
-                        Await (awaitable, (fun (ct) -> combine (next ct) repeat), ct)
+                    | Return _ -> repeat cTok ()
+                    | ReturnFrom t -> Await(t.GetAwaiter(), repeat)
+                    | Await (awaitable, next) ->
+                        Await (awaitable, fun cTok () -> combine cTok (next cTok ()) repeat)
                 else zero
             // Run the body the first time and chain it to the repeat logic.
-            combine (body ct) repeat
+            combine cTok (body ()) repeat
         else zero
 
     /// Wraps a step in a try/with. This catches exceptions both in the evaluation of the function
     /// to retrieve the step, and in the continuation of the step (if any).
-    let rec tryWith ct (step : CancellationToken -> Step<'a>) (catch : exn -> Step<'a>) =
+    let rec tryWith(step : unit -> Step<'a>) (catch : exn -> Step<'a>) =
         try
-            match step ct with
+            match step() with
             | Return _ as i -> i
-            | ReturnFrom (t, ct) ->
+            | ReturnFrom t ->
                 let awaitable = t.GetAwaiter()
-                let next = fun (ct) ->
+                Await(awaitable, fun cTok () ->
                     try
-                        Return(awaitable.GetResult(), ct)
+                        awaitable.GetResult() |> Return
                     with
-                    | exn -> catch exn
-                Await(awaitable, next, ct)
-            | Await (awaitable, next, ct) -> Await (awaitable, (fun (ct) -> tryWith ct next catch), ct)
+                    | exn -> catch exn)
+            | Await (awaitable, next) -> Await (awaitable, fun cTok () -> tryWith (next cTok) catch)
         with
         | exn -> catch exn
 
     /// Wraps a step in a try/finally. This catches exceptions both in the evaluation of the function
     /// to retrieve the step, and in the continuation of the step (if any).
-    let rec tryFinally ct (step : CancellationToken -> Step<'a>) fin =
+    let rec tryFinally (step : unit -> Step<'a>) fin =
         let step =
-            try step ct
+            try step()
             // Important point: we use a try/with, not a try/finally, to implement tryFinally.
             // The reason for this is that if we're just building a continuation, we definitely *shouldn't*
             // execute the `fin()` part yet -- the actual execution of the asynchronous code hasn't completed!
@@ -215,60 +194,54 @@ module TaskBuilder =
         | Return _ as i ->
             fin()
             i
-        | ReturnFrom (t, ct) ->
+        | ReturnFrom t ->
             let awaitable = t.GetAwaiter()
-            let next = fun (ct) ->
+            Await(awaitable, fun cTok () ->
                 let result =
                     try
-                        Return(awaitable.GetResult(), ct)
+                        awaitable.GetResult() |> Return
                     with
                     | _ ->
                         fin()
                         reraise()
                 fin() // if we got here we haven't run fin(), because we would've reraised after doing so
-                result
-            Await(awaitable,next, ct )
-        | Await (awaitable, next, ct) ->
-            Await (awaitable, (fun (ct) -> tryFinally ct next fin), ct)
+                result)
+        | Await (awaitable, next) ->
+            Await (awaitable, fun cTok () -> tryFinally (next cTok) fin)
 
     /// Implements a using statement that disposes `disp` after `body` has completed.
-    let using ct (disp : #IDisposable) (body : _ -> Step<'a>) =
+    let using (disp : #IDisposable) (body : _ -> Step<'a>) =
         // A using statement is just a try/finally with the finally block disposing if non-null.
-        tryFinally ct
-            (fun (ct) -> body disp) //TODO
+        tryFinally
+            (fun () -> body disp)
             (fun () -> if not (isNull (box disp)) then disp.Dispose())
 
     /// Implements a loop that runs `body` for each element in `sequence`.
-    let forLoop ct (sequence : 'a seq) (body : 'a -> Step<unit>) =
+    let forLoop cTok (sequence : 'a seq) (body : 'a -> Step<unit>) =
         // A for loop is just a using statement on the sequence's enumerator...
-        using ct (sequence.GetEnumerator())
+        using (sequence.GetEnumerator())
             // ... and its body is a while loop that advances the enumerator and runs the body on each element.
-            (fun e -> whileLoop ct e.MoveNext (fun (ct) -> body e.Current)) //TODO
+            (fun e -> whileLoop cTok e.MoveNext (fun () -> body e.Current))
 
     /// Runs a step as a task -- with a short-circuit for immediately completed steps.
-    let run parentCt (firstStep : unit -> Step<'a>) =
+    let run (cTok : CancellationToken) (firstStep : unit -> Step<'a>) =
         try
             match firstStep() with
-            | Return (x, ct) ->
-                use cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt, ct)
-                printfn "run.Return"
-                cts.Token.ThrowIfCancellationRequested ()
-                Task.FromResult(x)
-            | ReturnFrom (t, ct) ->
-                use cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt, ct)
-                printfn "run.ReturnFrom"
-                cts.Token.ThrowIfCancellationRequested ()
-                t
-            | Await (_,_,ct) as step ->
-                printfn "run.Await"
-                use cts = CancellationTokenSource.CreateLinkedTokenSource(parentCt, ct)
-                if cts.Token.IsCancellationRequested
-                then
-                    let cts = new TaskCompletionSource<_>(cts.Token)
-                    cts.SetCanceled ()
-                    cts.Task
+            | Return x ->
+                if cTok.IsCancellationRequested then
+                    Task.FromCanceled<_> cTok
                 else
-                    StepStateMachine<'a>(cts.Token, step).Run().Unwrap() // sadly can't do tail recursion
+                    Task.FromResult(x)
+            | ReturnFrom t ->
+                if cTok.IsCancellationRequested then
+                    Task.FromCanceled<_> cTok
+                else
+                    t
+            | Await _ as step ->
+                if cTok.IsCancellationRequested then
+                    Task.FromCanceled<_> cTok
+                else
+                    StepStateMachine<'a>(cTok, step).Run().Unwrap() // sadly can't do tail recursion
         // Any exceptions should go on the task, rather than being thrown from this call.
         // This matches C# behavior where you won't see an exception until awaiting the task,
         // even if it failed before reaching the first "await".
@@ -285,68 +258,43 @@ module TaskBuilder =
     type Priority2 = IComparable
 
     // type BindS = Priority1 with
-    //     static member inline (>>=) (_:Priority2, taskLike : 't) = fun (k:  _ -> 'b Step) -> Binder<'b>.GenericAwait (taskLike, k): 'b Step
-    //     static member        (>>=) (  Priority1, task: 'a Task) = fun (k: 'a -> 'b Step) -> bindTask task k                      : 'b Step
-    //     static member        (>>=) (  Priority1, a  : 'a Async) = fun (k: 'a -> 'b Step) -> bindTask (Async.StartAsTask a) k     : 'b Step
+    //     static member inline (>>=) (_:Priority2, taskLike : 't) = fun (k:  _ -> 'b Step) -> Binder<'b>.GenericAwait (taskLike, (fun ct -> k)): 'b Step
+    //     static member        (>>=) (  Priority1, task: 'a Task) = fun cTok (k: 'a -> 'b Step) -> bindTask cTok task (fun ct -> k)                      : 'b Step
+    //     static member        (>>=) (  Priority1, a  : 'a Async) = fun cTok (k: 'a -> 'b Step) -> bindTask cTok (Async.StartAsTask a) (fun ct -> k)     : 'b Step
 
     // type ReturnFromS = Priority1 with
     //     static member inline ($) (Priority1, taskLike    ) = Binder<_>.GenericAwait (taskLike, ret)
-    //     static member        ($) (Priority1, a : 'a Async) = bindTask (Async.StartAsTask a) ret : Step<'a>
+    //     static member        ($) (Priority1, a : 'a Async) = bindTask CancellationToken.None (Async.StartAsTask a) ret : Step<'a>
 
     type BindI = Priority1 with
-        static member inline (>>=) (_:Priority3, taskLike            : CancellationToken -> 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwait (taskLike, k, ct)                          : 'b Step
-        static member inline (>>=) (_:Priority3, taskLike            : 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwait ((fun ct -> taskLike), k, ct)                          : 'b Step
-        static member inline (>>=) (_:Priority2, configurableTaskLike: CancellationToken -> 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwaitConfigureFalse (configurableTaskLike, k, ct): 'b Step
-        static member inline (>>=) (_:Priority2, configurableTaskLike: 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwaitConfigureFalse ((fun ct -> configurableTaskLike), k, ct): 'b Step
-        static member        (>>=) (  Priority1, task: CancellationToken -> 'a Task) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct (task ct) k                                  : 'b Step
-        static member        (>>=) (  Priority1, task: 'a Task           ) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct task k                                  : 'b Step
-        static member        (>>=) (  Priority1, a   : 'a Async          ) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct (Async.StartAsTask a) k                 : 'b Step
+        static member inline (>>=) (_:Priority3, taskLike            : 't) = fun cTok (k :  _ -> 'b Step) -> Binder<'b>.GenericAwait (taskLike, (fun ct -> k))                          : 'b Step
+        static member inline (>>=) (_:Priority2, configurableTaskLike: 't) = fun cTok (k :  _ -> 'b Step) -> Binder<'b>.GenericAwaitConfigureFalse (configurableTaskLike, (fun ct -> k)): 'b Step
+        static member        (>>=) (  Priority1, task: 'a Task           ) = fun cTok (k : 'a -> 'b Step) -> bindTaskConfigureFalse cTok task (fun ct -> k)                                : 'b Step
+        static member        (>>=) (  Priority1, a   : 'a Async          ) = fun cTok (k : 'a -> 'b Step) -> bindTaskConfigureFalse cTok (Async.StartAsTask a) (fun ct -> k)                 : 'b Step
 
     type ReturnFromI = Priority1 with
-        static member inline ($) (_:Priority2, taskLike            ) = Binder<_>.GenericAwait(taskLike, ret CancellationToken.None, CancellationToken.None)
-        // static member inline ($) (  Priority1, configurableTaskLike) = Binder<_>.GenericAwaitConfigureFalse(configurableTaskLike, ret)
-        static member        ($) (  Priority1, a   : 'a Async      ) = bindTaskConfigureFalse CancellationToken.None (Async.StartAsTask a) (ret CancellationToken.None)
-        static member        ($) (  Priority1, task: 'a Task       ) = bindTaskConfigureFalse CancellationToken.None task (ret CancellationToken.None)
+        static member inline ($) (_:Priority2, taskLike            ) = Binder<_>.GenericAwait(taskLike, ret)
+        static member inline ($) (  Priority1, configurableTaskLike) = Binder<_>.GenericAwaitConfigureFalse(configurableTaskLike, ret)
+        static member        ($) (  Priority1, a   : 'a Async      ) = bindTaskConfigureFalse CancellationToken.None (Async.StartAsTask a) ret
 
     // New style task builder.
-    type TaskBuilderV2(?ct : CancellationToken) =
-        let disposables = ResizeArray<IDisposable>()
-        let mutable innerCt = Option.defaultValue CancellationToken.None ct
-        let mutable disposed = false
-        let cleanup () =
-            try
-                printfn "cleanup %i" disposables.Count
-                disposables |> Seq.iter(fun d -> d.Dispose())
-            with
-                e -> ()
-
-        member __.CancellationToken = innerCt
+    type TaskBuilderV2(?cTok : CancellationToken) =
+        let mutable innerCTok = cTok |> Option.defaultValue CancellationToken.None
+        member __.CancellationToken = innerCTok
         // These methods are consistent between all builders.
-        member __.Delay(f : CancellationToken -> Step<_>) = f
-        member __.Run(f : CancellationToken -> Step<'m>) =
-            fun ct ->
-                let cts = CancellationTokenSource.CreateLinkedTokenSource(ct, __.CancellationToken)
-                disposables.Add cts
-                innerCt <- cts.Token
-                (run cts.Token (fun () -> f cts.Token)).ContinueWith(fun (t : Task<_>) ->
-                    cleanup()
-                    t).Unwrap()
+        member __.Delay(f : unit -> Step<_>) = f
+        member __.Run(f : unit -> Step<'m>) = run __.CancellationToken f
         member __.Zero() = zero
-        member __.Return(x) = ret __.CancellationToken x
-        member __.Combine(step : unit Step, continuation) = combine step continuation
-        member __.While(condition : unit -> bool, body : CancellationToken -> unit Step) = whileLoop __.CancellationToken condition body
+        member __.Return(x) = ret x
+        member __.Combine(step : unit Step, continuation) = combine __.CancellationToken step continuation
+        member __.While(condition : unit -> bool, body : unit -> unit Step) = whileLoop __.CancellationToken condition body
         member __.For(sequence : _ seq, body : _ -> unit Step) = forLoop __.CancellationToken sequence body
-        member __.TryWith(body : CancellationToken -> _ Step, catch : exn -> _ Step) = tryWith __.CancellationToken body catch
-        member __.TryFinally(body : CancellationToken -> _ Step, fin : unit -> unit) = tryFinally __.CancellationToken body fin
-        member __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using __.CancellationToken disp body
+        member __.TryWith(body : unit -> _ Step, catch : exn -> _ Step) = tryWith body catch
+        member __.TryFinally(body : unit -> _ Step, fin : unit -> unit) = tryFinally body fin
+        member __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using disp body
         member __.ReturnFrom a : _ Step = ReturnFrom a
-        // interface IDisposable with
-        //     member self.Dispose() =
-        //         cleanup()
-        //         GC.SuppressFinalize(self)
-        // override __.Finalize() =
-        //     cleanup()
-    // Old style task builder. Retained for binary compatibility.
+
+    // // Old style task builder. Retained for binary compatibility.
     // type TaskBuilder() =
     //     // These methods are consistent between the two builders.
     //     // Unfortunately, inline members do not work with inheritance.
@@ -369,7 +317,7 @@ module TaskBuilder =
     //     member inline __.Bind(task : 'a Task, continuation : 'a -> 'b Step) : 'b Step =
     //         bindTask task continuation
 
-    // // Old style task builder. Retained for binary compatibility.
+    // Old style task builder. Retained for binary compatibility.
     // type ContextInsensitiveTaskBuilder() =
     //     // These methods are consistent between the two builders.
     //     // Unfortunately, inline members do not work with inheritance.
@@ -476,7 +424,7 @@ module V2 =
         /// This is often preferable when writing library code that is not context-aware, but undesirable when writing
         /// e.g. code that must interact with user interface controls on the same thread as its caller.
         let task = TaskBuilderV2()
-        let taskCt ct = TaskBuilderV2(ct)
+        let taskCt cTok = TaskBuilderV2(cTok)
         [<Obsolete("It is no longer necessary to wrap untyped System.Thread.Tasks.Task objects with \"unitTask\".")>]
         let unitTask (t : Task) = t.ConfigureAwait(false)
 
