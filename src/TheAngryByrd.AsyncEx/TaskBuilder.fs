@@ -293,12 +293,29 @@ module TaskBuilder =
     //     static member inline ($) (Priority1, taskLike    ) = Binder<_>.GenericAwait (taskLike, ret)
     //     static member        ($) (Priority1, a : 'a Async) = bindTask (Async.StartAsTask a) ret : Step<'a>
 
+
+    let toTaskUnit (t : Task) =
+        let tcs = TaskCompletionSource()
+        t.ContinueWith(fun t ->
+            if t.IsCanceled then
+                printfn "IsCanceled"
+                tcs.SetCanceled()
+            else if t.IsFaulted then
+                printfn "IsFaulted"
+                tcs.SetException t.Exception
+            else
+                printfn "result"
+                tcs.SetResult()
+            ) |> ignore
+        tcs.Task
     type BindI = Priority1 with
         static member inline (>>=) (_:Priority3, taskLike            : CancellationToken -> 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwait (taskLike, k, ct)                          : 'b Step
         static member inline (>>=) (_:Priority3, taskLike            : 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwait ((fun ct -> taskLike), k, ct)                          : 'b Step
         static member inline (>>=) (_:Priority2, configurableTaskLike: CancellationToken -> 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwaitConfigureFalse (configurableTaskLike, k, ct): 'b Step
         static member inline (>>=) (_:Priority2, configurableTaskLike: 't) = fun (ct : CancellationToken) (k :  _ -> 'b Step) -> Binder<'b>.GenericAwaitConfigureFalse ((fun ct -> configurableTaskLike), k, ct): 'b Step
+        static member        (>>=) (  Priority1, task: CancellationToken -> Task) = fun (ct : CancellationToken) (k : _ -> 'b Step) -> bindTaskConfigureFalse ct (task ct |> toTaskUnit) k                                  : 'b Step
         static member        (>>=) (  Priority1, task: CancellationToken -> 'a Task) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct (task ct) k                                  : 'b Step
+        static member        (>>=) (  Priority1, task: Task           ) = fun (ct : CancellationToken) (k : _ -> 'b Step) -> bindTaskConfigureFalse ct (task |> toTaskUnit) k                                  : 'b Step
         static member        (>>=) (  Priority1, task: 'a Task           ) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct task k                                  : 'b Step
         static member        (>>=) (  Priority1, a   : 'a Async          ) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct (Async.StartAsTask a) k                 : 'b Step
 

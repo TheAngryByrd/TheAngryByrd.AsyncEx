@@ -107,20 +107,6 @@ module Extensions =
 //             ()
 //     }
 
-let toTaskUnit (t : Task) =
-    let tcs = TaskCompletionSource()
-    t.ContinueWith(fun t ->
-        if t.IsCanceled then
-            printfn "IsCanceled"
-            tcs.SetCanceled()
-        else if t.IsFaulted then
-            printfn "IsFaulted"
-            tcs.SetException t.Exception
-        else
-            printfn "result"
-            tcs.SetResult()
-        ) |> ignore
-    tcs.Task
 
 // let ``AsyncResult passes along cancellationToken`` =
 //     testCaseAsync "AsyncResult passes along cancellationToken" <| async {
@@ -155,30 +141,26 @@ let toTaskUnit (t : Task) =
 //             ()
 //     }
 
-let ``Foo`` =
+let ``cancel2Deep`` =
     ftestCaseAsync "Foo" <| async {
         let mutable wasCalled = false
         let sideEffect () = task {
-            printfn "sideeffect1"
-
-            let mutable outterCt = Unchecked.defaultof<_>
-            // do! Task.Delay(TimeSpan.FromSeconds(25.))
             do! fun (ct : CancellationToken) ->
-                outterCt <- ct
-                printfn "ct -> %b" ct.CanBeCanceled
-                ct.Register(fun _ -> printfn "cancelled") |> ignore
-                Task.Delay(TimeSpan.FromSeconds(5.), ct) |> toTaskUnit
-            printfn "sideeffect2"
-            printfn "was outterCt canceled : %b" outterCt.IsCancellationRequested
+                Task.Delay(TimeSpan.FromSeconds(5.), ct)
             wasCalled <- true
+        }
+
+        let midLevel () = task {
+            let! r = sideEffect ()
+            return r
         }
 
 
         use cts = new CancellationTokenSource ()
 
         let topLevel () = taskCt cts.Token {
-            let! r = sideEffect ()
-            return ()
+            let! r = midLevel ()
+            return r
             // return! sideEffect CancellationToken.None
             // return r
         }
@@ -207,5 +189,5 @@ let tests =
     testList "AsyncTests" [
         // ``Bindable CancellableTask``
         // ``AsyncResult passes along cancellationToken``
-        ``Foo``
+        cancel2Deep
     ]
