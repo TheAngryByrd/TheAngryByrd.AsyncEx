@@ -317,7 +317,7 @@ module TaskBuilder =
         static member        (>>=) (  Priority1, task: CancellationToken -> 'a Task) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct (task ct) k                                  : 'b Step
         static member        (>>=) (  Priority1, task: Task           ) = fun (ct : CancellationToken) (k : _ -> 'b Step) -> bindTaskConfigureFalse ct (task |> toTaskUnit) k                                  : 'b Step
         static member        (>>=) (  Priority1, task: 'a Task           ) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct task k                                  : 'b Step
-        static member        (>>=) (  Priority1, a   : 'a Async          ) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct (Async.StartAsTask a) k                 : 'b Step
+        static member        (>>=) (  Priority1, a   : 'a Async          ) = fun (ct : CancellationToken) (k : 'a -> 'b Step) -> bindTaskConfigureFalse ct (Async.StartAsTask(a, cancellationToken = ct)) k                 : 'b Step
 
     type ReturnFromI = Priority1 with
         static member inline ($) (_:Priority2, taskLike            ) = Binder<_>.GenericAwait(taskLike, ret CancellationToken.None, CancellationToken.None)

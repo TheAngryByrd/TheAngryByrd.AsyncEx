@@ -22,7 +22,8 @@ module Debugging =
     ()
 #endif
 
-
+type ColdTask<'a> = unit -> Task<'a>
+type ColdUnitTask = unit -> Task
 type CancellableTask<'a> = CancellationToken -> Task<'a>
 type CancellableUnitTask = CancellationToken -> Task
 
@@ -141,8 +142,8 @@ module Extensions =
 //             ()
 //     }
 
-let ``cancel2Deep`` =
-    ftestCaseAsync "Foo" <| async {
+let cancel2Deep =
+    testCaseAsync "Cancel 2 deep CancellationToken -> Task" <| async {
         let mutable wasCalled = false
         let sideEffect () = task {
             do! fun (ct : CancellationToken) ->
@@ -161,28 +162,59 @@ let ``cancel2Deep`` =
         let topLevel () = taskCt cts.Token {
             let! r = midLevel ()
             return r
-            // return! sideEffect CancellationToken.None
-            // return r
         }
 
-        // Debugging.waitForDebuggerAttached "Foo"
-        // cts.Cancel()
-        cts.CancelAfter(TimeSpan.FromSeconds(1.1))
-        cts.Token.Register(fun _ -> printfn "top cancelled") |> ignore
+        cts.CancelAfter(TimeSpan.FromSeconds(4.1))
+        // cts.Token.Register(fun _ -> printfn "top cancelled") |> ignore
         try
-            let! _ = topLevel ()
-            ()
+            do! topLevel ()
         with
         | :? TaskCanceledException as e ->
             // Cancellation is the point here
-            printfn "TaskCanceledException -> %A" e
             ()
         | :? AggregateException as ae when ((ae.InnerExceptions |> Seq.head) :? TaskCanceledException) ->
-
-           printfn "TaskCanceledException -> %A" ae
-           ()
+            // Cancellation is the point here
+            ()
         Expect.isFalse wasCalled "Side effect should not occur"
     }
+
+
+let cancel2DeepCtToAsync =
+    testCaseAsync "Cancel 2 deep CancellationToken -> Async<unit>" <| async {
+        let mutable wasCalled = false
+        let sideEffect () = async {
+            let! ct = Async.CancellationToken
+            do! Task.Delay(TimeSpan.FromSeconds(5.), ct)
+            wasCalled <- true
+        }
+
+        let midLevel () = task {
+            let! r = sideEffect ()
+            return r
+        }
+
+
+        use cts = new CancellationTokenSource ()
+
+        let topLevel () = taskCt cts.Token {
+            let! r = midLevel ()
+            return r
+        }
+
+        cts.CancelAfter(TimeSpan.FromSeconds(4.1))
+        // cts.Token.Register(fun _ -> printfn "top cancelled") |> ignore
+        try
+            do! topLevel ()
+        with
+        | :? TaskCanceledException as e ->
+            // Cancellation is the point here
+            ()
+        | :? AggregateException as ae when ((ae.InnerExceptions |> Seq.head) :? TaskCanceledException) ->
+            // Cancellation is the point here
+            ()
+        Expect.isFalse wasCalled "Side effect should not occur"
+    }
+
 
 [<Tests>]
 let tests =
@@ -190,4 +222,5 @@ let tests =
         // ``Bindable CancellableTask``
         // ``AsyncResult passes along cancellationToken``
         cancel2Deep
+        cancel2DeepCtToAsync
     ]
